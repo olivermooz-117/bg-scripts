@@ -1,301 +1,280 @@
 # Blue-Green Deployment Strategy on AWS
 
+**Region:** US East (Ohio), `us-east-2`  |  **Author:** Oliver Moosberger  |  **Repo:** [olivermooz-117/bg-scripts](https://github.com/olivermooz-117/bg-scripts)
+
+## Table of Contents
+
+- [Blue-Green Deployment Strategy on AWS](#blue-green-deployment-strategy-on-aws)
+  - [Table of Contents](#table-of-contents)
+  - [1. Project Overview](#1-project-overview)
+  - [2. Architecture](#2-architecture)
+  - [3. Repository Contents](#3-repository-contents)
+  - [4. Environment Build](#4-environment-build)
+  - [5. Traffic Switching](#5-traffic-switching)
+  - [6. Validation and Traffic Test Results](#6-validation-and-traffic-test-results)
+  - [7. Failure Simulation](#7-failure-simulation)
+  - [8. Manual Rollback and Recovery](#8-manual-rollback-and-recovery)
+  - [9. CloudWatch Monitoring and SNS Notifications](#9-cloudwatch-monitoring-and-sns-notifications)
+  - [10. Automated Rollback with Lambda](#10-automated-rollback-with-lambda)
+  - [11. Manual Rollback Runbook](#11-manual-rollback-runbook)
+  - [12. Results and Lessons Learned](#12-results-and-lessons-learned)
+  - [13. Limitations and Future Improvements](#13-limitations-and-future-improvements)
+  - [14. Cleanup](#14-cleanup)
+
 ## 1. Project Overview
 
-This project demonstrates a Blue-Green deployment strategy for a web application hosted on Amazon EC2 instances behind an AWS Application Load Balancer (ALB).
+This project implements a Blue-Green deployment strategy for a web application on Amazon EC2 behind an Application Load Balancer (ALB). Two identical environments, Blue (current) and Green (new), run side by side. Traffic is shifted between them with weighted target groups, so a release can be validated on a small share of users and reversed in seconds.
 
-The goal is to improve deployment safety by maintaining separate Blue and Green environments, validating target health, shifting traffic between environments, monitoring application errors, and providing a rollback procedure when a deployment fails.
+It uses EC2, an ALB with weighted forwarding, AWS CLI and Bash automation, CloudWatch alarms, SNS email notifications and a Lambda rollback function.
 
-The project uses Amazon EC2, an Application Load Balancer, weighted target groups, AWS CLI, Bash automation scripts, Amazon CloudWatch alarms, Amazon SNS notifications, and a Lambda function tested for rollback logic.
+What was demonstrated:
 
-The project demonstrates:
-- Weighted traffic shifting between Blue and Green environments.
-- Application traffic testing using response headers.
-- Simulated HTTP 500 errors.
-- Manual rollback to the Blue environment.
-- Application recovery and post-rollback validation.
-- CloudWatch monitoring and SNS alarm notifications.
-- Successful manual testing of Lambda rollback logic.
-
-**Important limitation:** The Lambda rollback logic was successfully tested using a manual test event. End-to-end automatic rollback initiated by an actual CloudWatch alarm transition has not yet been verified.
+- Staged traffic shifting: 90/10, 50/50 and 0/100.
+- Health-gated switching: the script refuses to send traffic to an unhealthy target group.
+- Per-request verification using the `X-Environment` response header.
+- A deliberate HTTP 500 failure on Green, detected by CloudWatch.
+- Manual rollback to Blue and recovery validation.
+- A Lambda function that rolls back to Blue when the `bg-green-5xx` alarm fires.
 
 ## 2. Architecture
 
-The project consists of the following components:
-
-- **Blue environment:** The original application environment and intended rollback destination.
-- **Green environment:** The alternate environment used to validate deployments and receive traffic.
-- **Application Load Balancer:** Distributes incoming HTTP requests between Blue and Green.
-- **Blue target group:** `bg-blue-tg`
-- **Green target group:** `bg-green-tg`
-- **ALB:** `bg-alb`
-- **Amazon CloudWatch:** Monitors target health, HTTP 5xx errors, and response latency.
-- **Amazon SNS:** Sends alarm notifications through the `bg-deploy-alerts` topic.
-- **AWS Lambda:** `bg-auto-rollback`, tested manually to validate rollback logic.
-
-The ALB listener uses weighted forwarding to control the distribution of traffic between the two target groups.
-
-The deployment scripts allow traffic weights to be changed without rebuilding the application. Health checks are performed before traffic is shifted to an environment with a non-zero weight, unless the health-check bypass is explicitly enabled.
-
-### Architecture flow
+![Architecture diagram](mermaid-diagram.svg)
 
 ```text
-Users
-  |
-  v
-Application Load Balancer (bg-alb)
-  |
-  +---------------------+
-  |                     |
-  v                     v
-Blue Target Group     Green Target Group
-(bg-blue-tg)          (bg-green-tg)
-  |                     |
-  v                     v
-Blue EC2 instances    Green EC2 instances
+                         Users
+                           |
+                           v
+              Application Load Balancer (bg-alb)
+                  HTTP :80, weighted forwarding
+                   |                       |
+            weight (Blue)            weight (Green)
+                   v                       v
+         bg-blue-tg (Blue EC2)     bg-green-tg (Green EC2)
+          us-east-2a, v1            us-east-2b, v2
 
-CloudWatch Alarms
-  |
-  v
-Amazon SNS Notifications
-
-Lambda (bg-auto-rollback)
-  |
-  v
-Rollback logic tested manually
-  |
-  v
-Blue 100% / Green 0%
+Monitoring and automation:
+CloudWatch alarms --> SNS topic (bg-deploy-alerts) --+--> Email notification
+                                                     +--> Lambda (bg-auto-rollback)
+                                                              |
+                                                              v
+                                                   ALB listener: Blue 100 / Green 0
 ```
 
-The diagram represents the project components and the tested rollback logic. It does not imply that automatic CloudWatch-to-Lambda rollback has been verified end to end.
+| Component | Name / detail |
+|---|---|
+| Application Load Balancer | `bg-alb` (HTTP 80) |
+| Blue target group / instance | `bg-blue-tg`, serves `X-Environment: BLUE`, version 1 |
+| Green target group / instance | `bg-green-tg`, serves `X-Environment: GREEN`, version 2 |
+| Security group | `bg-web-sg` |
+| SNS topic | `bg-deploy-alerts` (email subscription confirmed, Lambda subscription) |
+| Lambda | `bg-auto-rollback` (Python, boto3) |
+| CloudWatch alarms | `bg-green-5xx`, `bg-green-unhealthy-hosts`, `bg-blue-unhealthy-hosts`, `bg-alb-high-latency` |
+
+![Target groups](docs/blue-green-target-groups.png)
+
+*Both target groups registered with the load balancer.*
+
+![Green application](docs/green-v2.png)
+
+*The Green environment (version 2) served through the ALB.*
 
 ## 3. Repository Contents
 
 | File | Description |
 |---|---|
-| `README.md` | Project documentation, test results, and operational procedures. |
-| `switch-traffic.sh` | Updates ALB listener weights between Blue and Green and checks target health by default. |
-| `traffic-test.sh` | Sends requests through the ALB and counts responses using the `X-Environment` header. |
-| `rollback.sh` | Returns traffic to Blue by configuring Blue to 100% and Green to 0%. |
-| `switch.log` | Records successful traffic-switching operations and timestamps. |
+| `README.md` | Documentation, test results and procedures. |
+| `switch-traffic.sh` | Sets the Blue/Green listener weights. Checks target health first, then logs the change. |
+| `traffic-test.sh` | Sends requests through the ALB and counts responses by `X-Environment`. |
+| `rollback.sh` | Returns all traffic to Blue (100/0). Bypasses the health gate with `SKIP_HEALTH_CHECK=1`. |
+| `lambda_function.py` | Source of the `bg-auto-rollback` Lambda function. |
+| `switch.log` | Timestamped record of every traffic change. |
+| `mermaid-diagram.svg` | Architecture diagram. |
+| `docs/` | Evidence screenshots. |
 
-The Lambda function is deployed in AWS as `bg-auto-rollback`. Its successful manual test is documented in this README; the Lambda source code and deployment configuration are not listed as files in this repository.
+## 4. Environment Build
 
-## 4. Prerequisites
-
-Before running the scripts, ensure that:
-
-- AWS CLI is installed and configured.
-- The AWS identity has permission to describe load balancers, listeners, and target groups and to modify the ALB listener.
-- Blue and Green EC2 instances and target groups have been created.
-- The ALB listener is configured on HTTP port 80.
-- Both target groups are registered with the ALB.
-- The scripts are executable.
-- The application returns an `X-Environment` response header identifying the environment serving the request.
-
-The project resources are deployed in the `us-east-2` (Ohio) AWS region.
-
-Navigate to the scripts directory:
+1. **Security group `bg-web-sg`:** inbound HTTP 80 from anywhere (ALB and instances) and SSH 22 from my IP only.
+2. **Two EC2 instances** (Amazon Linux 2023, `t3.micro`) in different Availability Zones. Each is launched with this user-data, changing only the environment name and version:
 
 ```bash
-cd ~/bg-scripts
+#!/bin/bash
+dnf install -y httpd
+systemctl enable --now httpd
+ENV=BLUE; VER=1          # GREEN / 2 on the second instance
+echo "<h1>${ENV} environment - version ${VER}</h1>" > /var/www/html/index.html
+echo "ok" > /var/www/html/health
+cat > /etc/httpd/conf.d/headers.conf <<EOF
+Header always set X-Environment "${ENV}"
+Header always set X-App-Version "${VER}"
+EOF
+systemctl restart httpd
 ```
 
-If necessary, make the scripts executable:
+3. **Target groups** `bg-blue-tg` and `bg-green-tg` (HTTP 80, health check path `/health`). One instance is registered in each.
+4. **Application Load Balancer** `bg-alb` (internet-facing, HTTP 80) with a listener that forwards to both target groups using weights.
+5. **Verification:** both target groups report `healthy`, and `curl -I` against the ALB returns the `X-Environment` header.
 
-```bash
-chmod +x switch-traffic.sh traffic-test.sh rollback.sh
-```
+![Blue target group](docs/blue-target-group.png)
+
+*Blue target group with a healthy registered target.*
+
+![Green target group](docs/green-target-health.png)
+
+*Green target group with a healthy registered target.*
 
 ## 5. Traffic Switching
 
-The `switch-traffic.sh` script accepts two arguments: the Blue traffic weight and the Green traffic weight.
-
-### Examples
-
-Send approximately 90% of traffic to Blue and 10% to Green:
+`switch-traffic.sh <blue_weight> <green_weight>` changes the ALB listener weights.
 
 ```bash
-./switch-traffic.sh 90 10
+./switch-traffic.sh 90 10     # canary: 90% Blue, 10% Green
+./switch-traffic.sh 50 50     # even split
+./switch-traffic.sh 0 100     # full cutover to Green
+./switch-traffic.sh 100 0     # back to Blue
 ```
 
-Split traffic between the environments:
+How it works:
 
-```bash
-./switch-traffic.sh 50 50
-```
+- It looks up the ALB, listener and target-group ARNs with the AWS CLI.
+- **Health gate:** it checks every target group with a non-zero weight and aborts if any target is unhealthy (override only with `SKIP_HEALTH_CHECK=1`).
+- It applies the weights with `modify-listener` and appends the weights and a UTC timestamp to `switch.log`.
 
-Send all traffic to Green:
+![Listener routing](docs/alb-listener-routing.png)
 
-```bash
-./switch-traffic.sh 0 100
-```
+*ALB listener forwarding rule with the two target groups.*
 
-Return all traffic to Blue:
+![Listener weights](docs/alb-listeners-weights.png)
 
-```bash
-./switch-traffic.sh 100 0
-```
+*Weighted forwarding configuration.*
 
-The script retrieves the ALB, target-group, and listener ARNs using the AWS CLI.
+![Listener traffic weights](docs/alb-listener-traffic-weights.png)
 
-Before changing the listener, the script checks the health of each target group assigned a non-zero traffic weight. If a target is not healthy, the script aborts the change unless the health-check bypass is explicitly enabled.
-
-After a successful listener update, the configured traffic weights and UTC timestamp are appended to `switch.log`.
-
-The configured weights represent the intended distribution. Actual request counts can differ because weighted routing is probabilistic.
+*Listener weights after a switch.*
 
 ## 6. Validation and Traffic Test Results
 
-Traffic was tested by sending HTTP requests through the ALB and counting responses based on the `X-Environment` response header.
+`traffic-test.sh <n>` sends `n` requests to the ALB and counts the `X-Environment` header in each response.
 
-### Recorded test results
-
-| Configuration | Requests | Blue responses | Green responses | Observation |
+| Configuration | Requests | Blue | Green | Observation |
 |---|---:|---:|---:|---|
-| 90/10 | 200 | 184 | 16 | Both environments received traffic. |
-| 50/50 | 40 | 26 | 14 | Both environments received traffic. |
-| 100% Green | 20 | 0 | 20 | All sampled requests reached Green. |
-| Rollback to 100% Blue | 20 | 20 | 0 | All sampled requests reached Blue. |
+| 90 / 10 | 200 | 184 | 16 | 92% / 8%, close to the configured split |
+| 50 / 50 | 40 | 26 | 14 | Both environments served traffic |
+| 0 / 100 (full cutover) | 20 | 0 | 20 | All requests reached Green |
+| Rollback to 100% Blue | 20 | 20 | 0 | All requests reached Blue |
 
-### Verification of the 90/10 configuration
+Notes:
 
-The ALB listener was inspected using the AWS CLI and confirmed to have:
+- Weighted routing is probabilistic, so small samples do not match the configured weights exactly. An earlier 90/10 run of 40 requests returned no Green responses; I did not treat it as proof and repeated the test with 200 requests.
+- Right after a weight change the ALB can take a few seconds to propagate. I wait about 30 seconds before measuring.
+- The listener weights were checked with `aws elbv2 describe-rules` / `describe-listeners` and matched the configured values.
 
-- Blue target group weight: `90`
-- Green target group weight: `10`
+![Traffic switching results](docs/traffic-switching-results.png)
 
-Both target groups reported a healthy target, and target-group stickiness was disabled.
-
-The 200-request test returned 184 Blue responses and 16 Green responses. This is an observed split of 92% Blue and 8% Green, demonstrating that both environments received traffic under the 90/10 configuration.
-
-An earlier 90/10 test returned 40 Blue responses and no Green responses across 40 requests. That result was not treated as proof of a successful 90/10 distribution. The later 200-request test confirmed that requests reached both target groups.
-
-An earlier 50/50 test recorded 29 Blue responses and 11 Green responses across 40 requests. This was a separate run from the 26/14 result shown in the table.
-
-### Repeat the traffic test
-
-Run:
-
-```bash
-./traffic-test.sh 200
-```
-
-The script queries the ALB endpoint and counts responses according to the environment header returned by the application.
-
-These results demonstrate that the listener configuration can be changed and that requests can reach both environments under different weighted configurations.
+*Request counts per environment for each stage.*
 
 ## 7. Failure Simulation
 
-A deliberate application failure was introduced on the Blue EC2 instance to test error handling and recovery.
-
-A temporary Apache configuration rule was created to return HTTP 500 responses:
+To test detection and rollback, a fault was injected on the **Green** instance while it was receiving traffic. A temporary Apache rule makes every request return HTTP 500:
 
 ```bash
-printf 'RewriteEngine On\nRewriteRule ^ - [R=500,L]\n' \
-  | sudo tee /etc/httpd/conf.d/fault.conf
-
+printf 'RewriteEngine On\nRewriteRule ^ - [R=500,L]\n' | sudo tee /etc/httpd/conf.d/fault.conf
 sudo systemctl reload httpd
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost/     # 500
 ```
 
-The local application response was checked:
+With Green receiving all traffic, 20 requests through the ALB returned 20 × HTTP 500. The resulting target 5XX errors drive the `bg-green-5xx` alarm (section 9).
 
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://localhost/
-```
+![Failure simulation](docs/failure-simulation.png)
 
-The result was:
+*HTTP 500 on the Green instance and 20 of 20 failed requests through the ALB.*
 
-```text
-500
-```
+## 8. Manual Rollback and Recovery
 
-Requests through the ALB also showed HTTP 500 errors during the failure test.
+Rollback is a traffic change, not an application repair, so there are two steps.
 
-This simulated a faulty application response and provided a practical test of error monitoring and the recovery procedure.
-
-**Note:** The failure simulation deliberately modified the Blue web server. The temporary rule had to be removed separately to restore the application.
-
-## 8. Manual Rollback and Application Recovery
-
-The `rollback.sh` script was used to return traffic to Blue.
-
-Run the script from the deployment scripts directory:
+1. **Restore traffic to Blue:**
 
 ```bash
 cd ~/bg-scripts
-./rollback.sh
+./rollback.sh          # equivalent to: SKIP_HEALTH_CHECK=1 ./switch-traffic.sh 100 0
 ```
 
-The script invokes the traffic-switching script with Blue set to 100% and Green set to 0%. It sets `SKIP_HEALTH_CHECK=1` to bypass the target health gate so that the listener configuration can be switched even if Blue is unhealthy.
+Rollback skips the health gate on purpose, so it works even if a target is flapping. Use it knowing Blue must be healthy. One recorded rollback took about 7.6 seconds.
 
-This bypass should be used carefully: redirecting traffic to an unhealthy Blue environment can result in application errors.
-
-Changing the listener does not repair an application failure, so the application must be recovered separately.
-
-### Restore the Blue application
-
-Connect to the Blue EC2 instance and remove the temporary fault configuration:
+2. **Repair Green** (remove the injected fault):
 
 ```bash
 sudo rm -f /etc/httpd/conf.d/fault.conf
 sudo systemctl reload httpd
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost/     # 200
 ```
 
-Verify the local response:
+3. **Verify:** `./traffic-test.sh 20` returned 20 of 20 `X-Environment: BLUE` responses.
 
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://localhost/
-```
+![Rollback and recovery](docs/rollback-recovery.png)
 
-The response returned HTTP 200 after the temporary fault rule was removed and Apache was reloaded.
+*Rollback to Blue, Green fault removed (HTTP 200), and 20 of 20 requests served by Blue.*
 
-Exit the SSH session and test the ALB again:
-
-```bash
-cd ~/bg-scripts
-./traffic-test.sh 20
-```
-
-The post-rollback test returned 20 Blue responses out of 20 requests.
-
-An earlier recovery test also recorded 40 HTTP 200 responses after rollback. One recorded rollback execution took approximately 7.6 seconds.
-
-These tests demonstrate that the manual rollback procedure restored traffic routing to Blue and that the application returned successful responses after the fault was removed.
+**Final state:** after testing, the listener was set back to Blue 100% / Green 0% (last entry in `switch.log`).
 
 ## 9. CloudWatch Monitoring and SNS Notifications
 
-CloudWatch alarms were configured in the `us-east-2` region to monitor application and target-group health.
-
-| Alarm | Purpose | Configured threshold |
+| Alarm | Metric (`AWS/ApplicationELB`) | Condition |
 |---|---|---|
-| `bg-green-unhealthy-hosts` | Detects unhealthy Green targets. | At least 1 unhealthy target for 2 datapoints within 2 minutes. |
-| `bg-green-5xx` | Detects target HTTP 5xx errors. | At least 5 target 5xx responses in 1 datapoint within 1 minute. |
-| `bg-alb-high-latency` | Detects elevated target response latency. | Response time greater than 1 second for 3 datapoints within 3 minutes. |
-| `bg-blue-unhealthy-hosts` | Detects unhealthy Blue targets. | At least 1 unhealthy target for 2 datapoints within 2 minutes. |
+| `bg-green-5xx` | `HTTPCode_Target_5XX_Count` (Green target group) | Sum >= 5 in 1 minute |
+| `bg-green-unhealthy-hosts` | `UnHealthyHostCount` (Green) | >= 1 for 2 of 2 minutes |
+| `bg-blue-unhealthy-hosts` | `UnHealthyHostCount` (Blue) | >= 1 for 2 of 2 minutes |
+| `bg-alb-high-latency` | `TargetResponseTime` | > 1 second for 3 of 3 minutes |
 
-During testing, the Green unhealthy-host and Green 5xx alarms were observed in the `ALARM` state. The high-latency and Blue unhealthy-host alarms were observed in the `OK` state at the time checked. Alarm states can change as metrics change.
+All alarms use `treat missing data = notBreaching` and send to the SNS topic `bg-deploy-alerts`. During the failure test, `bg-green-5xx` and `bg-green-unhealthy-hosts` went to `ALARM`; the latency and Blue alarms stayed `OK`.
 
-### SNS notification verification
+The alarm history shows the SNS notification action executing successfully on 27 October 2026 at 13:14:54 UTC, and the email subscription is confirmed.
 
-The `bg-green-5xx` alarm was configured to send a notification to the SNS topic:
+![CloudWatch alarms](docs/cloudwatch-alarms.png)
 
-```text
-bg-deploy-alerts
+*The four alarms and their states.*
+
+![Alarm actions](docs/cloudwatch-alarm-actions.png)
+
+*Alarm actions publishing to `bg-deploy-alerts`.*
+
+![Alarm notifications](docs/cloudwatch-alarm-notifications.png)
+
+*Alarm notification evidence.*
+
+![SNS topic](docs/sns-topic-notification.png)
+
+*SNS topic and subscription.*
+
+![SNS notification](docs/sns-topic-notification-2.png)
+
+*Notification delivered by SNS.*
+
+## 10. Automated Rollback with Lambda
+
+`lambda_function.py` is deployed as `bg-auto-rollback`. It automates the same rollback as `rollback.sh`.
+
+**Trigger wiring:** the function is subscribed to the SNS topic `bg-deploy-alerts`, and SNS is permitted to invoke it:
+
+```bash
+aws lambda add-permission --function-name bg-auto-rollback --statement-id sns-invoke \
+  --action lambda:InvokeFunction --principal sns.amazonaws.com --source-arn "$TOPIC_ARN"
+aws sns subscribe --topic-arn "$TOPIC_ARN" --protocol lambda --notification-endpoint "$FN_ARN"
 ```
 
-The alarm history recorded successful execution of the SNS notification action on 27 October 2026 at 13:14:54 UTC.
+**Flow:** `bg-green-5xx` enters `ALARM` -> CloudWatch publishes to `bg-deploy-alerts` -> SNS invokes the Lambda (and emails me) -> the Lambda moves the listener to Blue 100 / Green 0.
 
-This verifies that the CloudWatch alarm notification action executed. An SNS notification is separate from a rollback action and does not, by itself, demonstrate that traffic was automatically redirected.
+**Logic and safeguards:**
 
-## 10. Lambda Rollback Logic Test
+1. Accepts either a direct alarm event or an SNS record (parses the JSON message).
+2. Ignores everything except alarm `bg-green-5xx` in state `ALARM`, so other alarms cannot trigger a rollback.
+3. Looks up `bg-alb` and confirms both target groups belong to it.
+4. **Refuses to roll back if Blue has no registered targets or any Blue target is unhealthy**, so it never moves traffic to a broken environment.
+5. Calls `modify_listener` on the HTTP:80 listener with Blue weight 100 and Green weight 0.
 
-A Lambda function named `bg-auto-rollback` was configured as part of the rollback automation work.
+**Permissions:** the execution role allows `elasticloadbalancing:DescribeLoadBalancers`, `DescribeTargetGroups`, `DescribeListeners`, `DescribeTargetHealth` and `ModifyListener`, plus CloudWatch Logs write access.
 
-The Lambda rollback logic was tested successfully using a manual test event simulating an alarm transition.
-
-The test event contained the following information:
+**Test:** the function was invoked with a controlled alarm event:
 
 ```json
 {
@@ -307,117 +286,37 @@ The test event contained the following information:
 }
 ```
 
-The successful test produced the following log message:
+Result in CloudWatch Logs: `AUTOMATIC ROLLBACK SUCCESS: Blue=100%, Green=0%`, and the listener showed Blue 100 / Green 0.
 
-```text
-AUTOMATIC ROLLBACK SUCCESS: Blue=100%, Green=0%
-```
-
-The test demonstrates that the Lambda rollback logic executed successfully for the manually supplied event and reported the intended final traffic configuration.
-
-### What this test proves
-
-- The Lambda function executed for the manual test event.
-- The rollback logic reported successful completion.
-- The intended final routing was Blue at 100% and Green at 0%.
-
-### What this test does not yet prove
-
-- That a real CloudWatch alarm transition automatically invoked the Lambda function.
-- That an actual alarm-triggered invocation completed the rollback end to end.
-- That rollback will always succeed if the Blue target group or application is unhealthy.
-
-**Current status:** Lambda rollback logic tested successfully. Automatic CloudWatch-triggered rollback has not yet been verified end to end.
-
-To complete that verification, a real alarm transition must be correlated with the Lambda invocation in CloudWatch Logs and evidence of the resulting ALB listener configuration.
+**Current status:** the rollback logic is tested with a controlled event, and the SNS-to-Lambda trigger is configured. An alarm-driven run is the next test: shift to 50/50, inject the fault on Green, and confirm that the alarm, the Lambda invocation and the final listener state line up in the logs.
 
 ## 11. Manual Rollback Runbook
 
-If Green fails validation or begins producing unacceptable errors, use the following procedure.
+1. Check target health (EC2 console or `aws elbv2 describe-target-health`).
+2. Review the CloudWatch alarms and application logs.
+3. Run `./rollback.sh`.
+4. Confirm the listener weights are Blue `100` / Green `0`.
+5. Fix the faulty instance separately.
+6. Run `./traffic-test.sh 20` and confirm all responses come from Blue with HTTP 200.
+7. Investigate and revalidate Green before the next deployment.
 
-1. Inspect target health in the EC2 console or using the AWS CLI.
-2. Review the relevant CloudWatch alarms and application logs.
-3. Run the rollback script:
+## 12. Results and Lessons Learned
 
-   ```bash
-   cd ~/bg-scripts
-   ./rollback.sh
-   ```
+- Weighted forwarding allows safe, staged releases: 10%, then 50%, then 100%.
+- A health gate in the switch script prevents sending traffic to an unhealthy environment.
+- The `X-Environment` header makes routing verifiable per request, not assumed.
+- ALB weight changes take a few seconds to propagate, and small samples vary, so tests need a wait and a larger sample.
+- Rolling back traffic and repairing the application are separate steps.
+- Automation needs guardrails: the Lambda checks that Blue is healthy before it acts.
 
-4. Verify the listener weights are Blue `100` and Green `0`.
-5. Repair the faulty application or server separately if necessary.
-6. Test the ALB endpoint:
+## 13. Limitations and Future Improvements
 
-   ```bash
-   ./traffic-test.sh 20
-   ```
+- Single instance per environment; production would use Auto Scaling groups per target group.
+- HTTP only; production would terminate HTTPS with an ACM certificate.
+- Add smoke tests before each shift and larger sample sizes.
+- Gradual automated shifting (for example 10, 25, 50, 100) with automatic rollback at each step.
+- Manage the infrastructure with CloudFormation or Terraform.
 
-7. Confirm that requests reach Blue and that the application returns successful HTTP responses.
-8. Investigate and validate Green before attempting another deployment.
+## 14. Cleanup
 
-The rollback script changes the traffic configuration; it does not repair a failed application or guarantee that Blue is healthy. Always verify application health after rollback.
-
-## 12. Evidence and Screenshots
-
-The following screenshots are recommended to document the implementation and test results.
-
-| Screenshot | Evidence |
-|---|---|
-| ALB listener configuration | Shows the weighted forwarding rules for Blue and Green. |
-| Blue target-group health | Shows registered Blue targets and their health. |
-| Green target-group health | Shows registered Green targets and their health. |
-| Weighted traffic test output | Shows requests reaching Blue and Green under a configured split. |
-| Manual rollback output | Shows the rollback script execution. |
-| Final listener routing | Shows Blue at 100% and Green at 0%. |
-| Failure simulation | Shows the HTTP 500 response during testing. |
-| Post-recovery test | Shows successful responses after the fault configuration was removed. |
-| CloudWatch alarm history | Shows alarm state transitions and action history. |
-| SNS notification evidence | Shows the configured topic and notification action. |
-| Lambda manual test | Shows the successful test invocation and rollback result. |
-| Lambda execution logs | Shows the `AUTOMATIC ROLLBACK SUCCESS` message. |
-
-If automatic rollback is required by the assessment, also capture evidence of a real CloudWatch alarm transition, the corresponding Lambda invocation, and the resulting listener configuration. Do not present a manually supplied Lambda test event as proof of an automatic alarm-triggered rollback.
-
-## 13. Results and Lessons Learned
-
-The project demonstrated the following:
-
-- Separate Blue and Green target groups behind an Application Load Balancer.
-- ALB weighted forwarding with 90/10, 50/50, and 0/100 configurations.
-- Verification of listener weights and target health using the AWS CLI.
-- Traffic reaching both environments during the latest 90/10 and 50/50 tests.
-- Full sampled traffic delivery to Green under the 0/100 configuration.
-- Deliberate simulation of HTTP 500 errors.
-- Manual rollback to Blue and successful application recovery.
-- CloudWatch alarm monitoring and successful execution of an SNS notification action.
-- Successful manual testing of the Lambda rollback logic, which reported Blue at 100% and Green at 0%.
-
-The tests highlighted the importance of verifying actual listener configuration, inspecting target health, checking application response headers, and recording real test results rather than assuming that configured traffic weights will produce an exact split in every sample.
-
-They also reinforced that traffic rollback and application recovery are distinct steps: redirecting requests to Blue does not repair a faulty server.
-
-Finally, testing the Lambda rollback logic and verifying automatic CloudWatch-triggered execution are separate milestones. The first was successfully tested; the second remains unverified.
-
-## 14. Limitations and Future Improvements
-
-Potential improvements include:
-
-- Verifying the complete CloudWatch-to-Lambda automatic rollback workflow with a real alarm transition.
-- Recording correlated alarm history, Lambda invocation logs, and final ALB listener state.
-- Adding stricter input validation to reject invalid traffic weights before changing the listener.
-- Automating application smoke tests before shifting traffic to Green.
-- Repeating weighted-routing tests with larger request samples.
-- Recording additional latency, error-rate, and recovery-time measurements.
-- Retaining screenshots and terminal output as evidence of tested configurations and results.
-- Confirming that the Blue environment remains healthy before relying on it as the rollback destination.
-- Adding the Lambda source code and deployment configuration to the repository if appropriate for the project requirements.
-
-## 15. Conclusion
-
-This project demonstrates a practical Blue-Green deployment approach using Amazon EC2, an Application Load Balancer, weighted target groups, Bash scripts, CloudWatch alarms, and SNS notifications.
-
-Testing covered weighted traffic switching, application failure simulation, manual rollback, and post-recovery validation. The latest 90/10 test confirmed that requests reached both Blue and Green, while the failure-recovery test demonstrated that traffic could be returned to Blue and the application restored.
-
-CloudWatch alarm notification actions were verified, and the Lambda rollback logic was successfully tested using a manual test event.
-
-**Final status:** Manual Blue/Green traffic switching and rollback demonstrated; Lambda rollback logic tested successfully; end-to-end automatic CloudWatch-triggered rollback remains to be verified.
+After grading, remove the ALB, both target groups, both EC2 instances, the security group, the Lambda function, the CloudWatch alarms, the SNS topic and the key pair to avoid charges.
